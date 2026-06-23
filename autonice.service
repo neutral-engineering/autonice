@@ -16,7 +16,7 @@ After=multi-user.target
 
 [Service]
 ExecStart=/usr/local/bin/autonice
-Environment=RUST_LOG=info
+Environment=RUST_LOG=error
 Restart=on-failure
 RestartSec=2
 

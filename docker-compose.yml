@@ -1,0 +1,44 @@
+# Local test harness — run the daemon against the *host's* execs in a container.
+#
+# This does NOT build autonice. Building needs the nightly + rust-src +
+# bpf-linker toolchain, so build natively first (`make build`); the image is
+# just a thin Arch userland that runs the host-built binary. autonice already
+# embeds its eBPF object, so the binary is all the container needs. Arch base
+# matches the host glibc the binary was linked against — a binary built on Arch
+# won't run on debian-slim.
+#
+# Why the privileged settings:
+#   * pid: host  — THE important one. autonice's eBPF reports init-namespace
+#     (global) pids; the daemon then reads /proc/<pid>/stat and calls
+#     setpriority(pid) with them. setpriority interprets the pid in the CALLER's
+#     pid namespace, so without the host pid namespace the daemon would renice
+#     the wrong process / nothing. `pid: host` also makes /proc show host tasks.
+#   * privileged  — load BPF + attach the tracepoint + renice others. The
+#     narrower alternative is `cap_add: [BPF, PERFMON, SYS_NICE]`, but privileged
+#     is the reliable default for tracefs access in dev.
+# The tracepoint is global regardless, so you'll see every exec on the machine.
+#
+#   make build && docker compose up
+#
+# Edit code -> `make build` -> `docker compose restart`. Ctrl-C (or `docker
+# compose down`) to stop. This is barely isolated from the host (privileged +
+# pid:host) — it's a convenience harness, not a sandbox.
+services:
+  autonice:
+    image: archlinux:base
+    privileged: true
+    pid: host
+    ulimits:
+      memlock: -1
+    volumes:
+      # Host-built binary (debug). For a release build, swap in target/release.
+      - ./target/debug/autonice:/usr/local/bin/autonice:ro
+      # Rules. The daemon checks ./autonice.toml then /etc/autonice.toml; cwd is
+      # / in the container, so mount the config at its system path.
+      - ./autonice.toml:/etc/autonice.toml:ro
+      # tracefs — read to resolve + attach the sched_process_exec tracepoint.
+      # (BTF at /sys/kernel/btf is already visible via the container's sysfs.)
+      - /sys/kernel/tracing:/sys/kernel/tracing:ro
+    environment:
+      RUST_LOG: info
+    command: ["autonice"]

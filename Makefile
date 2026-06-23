@@ -8,7 +8,7 @@ OBJ      := $(shell find target -path '*aya-build*/bpfel-unknown-none/release/au
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build release run check test fmt clippy ebpf-dump tracepoint-format deps clean
+.PHONY: help build release run check test fmt clippy ebpf-dump tracepoint-format deps clean docker
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -50,3 +50,6 @@ deps: ## Install build prerequisites (bpf-linker + nightly rust-src)
 
 clean: ## Remove build artifacts
 	cargo clean
+
+docker:
+	docker compose up

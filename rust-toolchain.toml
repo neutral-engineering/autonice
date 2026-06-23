@@ -1,0 +1,8 @@
+# Pins the toolchain used to build the eBPF crate (compiled via `-Z build-std`,
+# which is sensitive to the exact nightly). Userspace builds fine on stable too,
+# but pinning here keeps `cargo build` reproducible across machines.
+[toolchain]
+channel = "nightly-2026-06-22"
+# NOTE: do not add `targets = ["bpfel-unknown-none"]` — it has no prebuilt
+# rust-std; the eBPF crate is built from source via `-Z build-std` + rust-src.
+components = ["rust-src", "rustfmt", "clippy"]

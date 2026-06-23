@@ -1,0 +1,42 @@
+# autonice systemd unit — runs the daemon with just the capabilities it needs
+# instead of full root.
+#
+# Install:
+#   sudo install -Dm755 target/release/autonice /usr/local/bin/autonice
+#   sudo install -Dm644 autonice.toml          /etc/autonice.toml
+#   sudo install -Dm644 autonice.service        /etc/systemd/system/autonice.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now autonice
+#
+# Logs: journalctl -u autonice -f
+
+[Unit]
+Description=autonice — eBPF-driven automatic renicing
+Documentation=https://github.com/neutral-engineering/autonice
+After=multi-user.target
+
+[Service]
+ExecStart=/usr/local/bin/autonice
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=2
+
+# Capabilities: load BPF (CAP_BPF + CAP_PERFMON) and renice any process /
+# set negative nice (CAP_SYS_NICE). No full root required.
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_NICE
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_NICE
+NoNewPrivileges=true
+
+# Hardening.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+RestrictNamespaces=true
+RestrictRealtime=true
+MemoryDenyWriteExecute=false
+LockPersonality=true
+# autonice needs to read /proc/<pid>/stat for subtree tracking; default is fine.
+
+[Install]
+WantedBy=multi-user.target

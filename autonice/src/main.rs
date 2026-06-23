@@ -9,30 +9,69 @@
 //!   * cargo subtree ([cargo]) — renice `cargo` AND everything it spawns
 //!     transitively (rustc, build scripts, cc, ld), tracked by parent pid.
 
+mod install;
+
 use std::collections::{HashMap, HashSet};
 use std::mem;
 
 use anyhow::Context as _;
+use autonice_common::ExecEvent;
 use aya::maps::RingBuf;
 use aya::programs::TracePoint;
-use autonice_common::ExecEvent;
 use log::{debug, info, warn};
 use serde::Deserialize;
 use tokio::io::unix::AsyncFd;
-use tokio::signal;
+use tokio::signal::unix::{SignalKind, signal};
 
 /// How many events between sweeps that drop dead pids from the subtree set.
 const PRUNE_INTERVAL: u32 = 500;
 
 #[derive(Debug, Deserialize, Default)]
 struct Config {
-    /// match-key -> nice value. A key matches a binary's basename or, failing
-    /// that, any substring of its full exec path.
+    /// match-key -> rule. A key matches a binary's basename; a rule can opt in
+    /// to also matching any substring of the full exec path with
+    /// `substring = true`.
     #[serde(default)]
-    rules: HashMap<String, i32>,
+    rules: HashMap<String, Rule>,
     /// If present, renice `cargo` and its entire process subtree to this nice.
     #[serde(default)]
     cargo: Option<CargoConfig>,
+}
+
+/// A `[rules]` value, in either shorthand or table form:
+///   dd = 19                               # basename only
+///   dd = { nice = 19, substring = true }  # also match any path substring
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Rule {
+    Nice(i32),
+    Table {
+        nice: i32,
+        /// Also match any substring of the full exec path, not just the
+        /// basename. Off by default (so e.g. `dd` won't match `ssh-add`).
+        #[serde(default)]
+        substring: bool,
+    },
+}
+
+impl Rule {
+    fn nice(&self) -> i32 {
+        match self {
+            Rule::Nice(n) => *n,
+            Rule::Table { nice, .. } => *nice,
+        }
+    }
+
+    /// Whether this rule may also match a path substring (not just the basename).
+    fn substring(&self) -> bool {
+        matches!(
+            self,
+            Rule::Table {
+                substring: true,
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,22 +80,28 @@ struct CargoConfig {
 }
 
 impl Config {
-    /// First matching rule wins (basename equality preferred over substring).
+    /// First matching rule wins: an exact basename match (any rule form), then a
+    /// path-substring match (only rules that opt in with `substring = true`).
     fn nice_for(&self, path: &str) -> Option<i32> {
         let basename = basename(path);
-        if let Some(n) = self.rules.get(basename) {
-            return Some(*n);
+        if let Some(rule) = self.rules.get(basename) {
+            return Some(rule.nice());
         }
         self.rules
             .iter()
-            .find(|(k, _)| path.contains(k.as_str()))
-            .map(|(_, n)| *n)
+            .find(|(k, rule)| rule.substring() && path.contains(k.as_str()))
+            .map(|(_, rule)| rule.nice())
     }
 }
 
 fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
+
+/// The starter config, baked into the binary. Used three ways: written by
+/// `autonice install`, printed by `autonice default`, and parsed as the runtime
+/// fallback when no config file is found on disk.
+pub(crate) const DEFAULT_CONFIG: &str = include_str!("../../autonice.toml");
 
 fn load_config() -> Config {
     for path in ["autonice.toml", "/etc/autonice.toml"] {
@@ -78,8 +123,10 @@ fn load_config() -> Config {
             }
         }
     }
-    warn!("no config found (autonice.toml / /etc/autonice.toml); no rules active");
-    Config::default()
+    // No config file on disk — fall back to the built-in default so a fresh
+    // install acts sensibly out of the box (`autonice default` prints it).
+    info!("no config file found; using built-in defaults (see `autonice default`)");
+    toml::from_str(DEFAULT_CONFIG).expect("embedded default config must parse")
 }
 
 /// Parent pid of `pid` from /proc/<pid>/stat. The `comm` field can contain
@@ -179,8 +226,41 @@ impl Daemon {
     }
 }
 
+fn print_usage() {
+    eprintln!(
+        "autonice — eBPF-driven automatic renicing\n\
+         \n\
+         Usage:\n  \
+         autonice            Run the daemon (default).\n  \
+         autonice install    Install + enable the systemd service (needs root).\n  \
+         autonice default    Print the built-in default config to stdout.\n  \
+         autonice help       Show this help."
+    );
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Subcommand dispatch before any daemon setup. `install` does plain sync
+    // filesystem + systemctl work; everything else (or no arg) runs the daemon.
+    match std::env::args().nth(1).as_deref() {
+        Some("install") => return install::run(),
+        Some("default") => {
+            // Trailing newline comes from the embedded file; don't add another.
+            print!("{DEFAULT_CONFIG}");
+            return Ok(());
+        }
+        Some("help" | "-h" | "--help") => {
+            print_usage();
+            return Ok(());
+        }
+        None | Some("run") => {}
+        Some(other) => {
+            eprintln!("autonice: unknown subcommand `{other}`\n");
+            print_usage();
+            std::process::exit(2);
+        }
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let mut daemon = Daemon::new(load_config());
@@ -213,12 +293,20 @@ async fn main() -> anyhow::Result<()> {
     let ring = RingBuf::try_from(ebpf.take_map("EVENTS").context("EVENTS map not found")?)?;
     let mut async_fd = AsyncFd::new(ring)?;
 
-    let mut shutdown = Box::pin(signal::ctrl_c());
+    // Shut down on SIGINT (Ctrl-C) or SIGTERM — the latter is what `systemctl
+    // stop` and `docker stop`/`compose down` send. The kernel auto-detaches the
+    // BPF program when we exit; this just lets us log a clean shutdown.
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
 
     loop {
         tokio::select! {
-            _ = &mut shutdown => {
-                info!("shutting down");
+            _ = sigint.recv() => {
+                info!("received SIGINT, shutting down");
+                return Ok(());
+            }
+            _ = sigterm.recv() => {
+                info!("received SIGTERM, shutting down");
                 return Ok(());
             }
             guard = async_fd.readable_mut() => {
@@ -230,5 +318,34 @@ async fn main() -> anyhow::Result<()> {
                 guard.clear_ready();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The embedded default must parse — `load_config` unwraps it, and
+    /// `autonice install`/`default` ship it verbatim.
+    #[test]
+    fn embedded_default_config_parses() {
+        let cfg: Config = toml::from_str(DEFAULT_CONFIG).expect("default config parses");
+        assert!(cfg.cargo.is_some(), "default ships cargo-subtree tracking");
+        assert!(!cfg.rules.is_empty(), "default ships some rules");
+    }
+
+    #[test]
+    fn shorthand_rule_matches_basename_only() {
+        let cfg: Config = toml::from_str("[rules]\ndd = 19\n").unwrap();
+        assert_eq!(cfg.nice_for("/usr/bin/dd"), Some(19)); // exact basename
+        assert_eq!(cfg.nice_for("/usr/bin/ssh-add"), None); // no substring by default
+    }
+
+    #[test]
+    fn substring_rule_matches_path() {
+        let cfg: Config =
+            toml::from_str("[rules]\ndd = { nice = 19, substring = true }\n").unwrap();
+        assert_eq!(cfg.nice_for("/usr/bin/dd"), Some(19)); // exact basename
+        assert_eq!(cfg.nice_for("/usr/bin/ssh-add"), Some(19)); // opted-in substring
     }
 }

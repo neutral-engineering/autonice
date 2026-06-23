@@ -1,0 +1,218 @@
+# Forgejo CI. `runs-on: docker` runs each job inside a container on the runner's
+# Docker daemon. The default `docker` label image provides git + node so the JS
+# actions (checkout) run; rust is added by dtolnay/rust-toolchain.
+#
+# autonice embeds its eBPF program: build.rs compiles the `autonice-ebpf` crate
+# to a BPF ELF (aya-build, cargo-in-cargo with `-Z build-std`) and the userspace
+# binary bakes it in via `include_bytes_aligned!` — so the artifact is a single
+# self-contained binary. But that means every host build (even `cargo test`/
+# `clippy`) runs build.rs, which needs the full eBPF toolchain:
+#   * the *rolling* `nightly` + rust-src — aya-build shells out to `rustup run
+#     nightly`, so the eBPF crate is built with the latest nightly, not the
+#     date-pinned one. This is exactly what `make deps` installs.
+#   * the date-pinned nightly-2026-06-22 (rust-toolchain.toml) — the active
+#     toolchain for the userspace build + fmt/clippy.
+#   * bpf-linker — the linker for the BPF object.
+# There's no userspace-only shortcut on a clean checkout (AYA_BUILD_SKIP only
+# helps once an object already exists). Nothing here needs root — loading the
+# BPF program into the kernel is a runtime concern, not a build one.
+name: ci
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # .cargo/config.toml sets `runner = "sudo -E"` so `cargo run`/`make run` can
+  # load BPF + renice. The runner also wraps `cargo test`'s binaries, so without
+  # this CI would try to `sudo` them (the runner can't be set empty — cargo
+  # rejects that — so override it with `env`, a no-op passthrough that execs the
+  # test binary directly). The per-triple env override wins over cfg(all()).
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "env"
+jobs:
+  rust:
+    name: rust test/clippy/fmt
+    runs-on: docker
+    if: ${{ github.server_url != 'https://github.com' }}
+
+    steps:
+      - name: checkout code
+        uses: https://github.com/actions/checkout@v6
+
+      # Restore the toolchain (+ ~/.cargo/bin, where bpf-linker lives) before
+      # installing, so the install steps are a no-op on a warm cache. Keyed on
+      # rust-toolchain.toml so a nightly bump busts the cache.
+      - name: cache rust toolchain
+        uses: https://github.com/actions/cache@v5
+        with:
+          path: |
+            ~/.rustup
+            ~/.cargo/bin
+          key: ${{ runner.os }}-rust-toolchain-${{ hashFiles('rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-toolchain-
+
+      # rust-toolchain.toml selects nightly-2026-06-22 for the userspace build +
+      # fmt/clippy; install it (with components) here. Bump both together. This
+      # step also bootstraps rustup, which the next step uses.
+      - name: install rust toolchain (pinned)
+        uses: https://github.com/dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-22
+          components: rust-src, rustfmt, clippy
+
+      # aya-build builds the eBPF crate via `rustup run nightly` (rolling), so we
+      # also need the rolling nightly + rust-src for `-Z build-std`, plus the BPF
+      # linker — exactly `make deps`. Restored from the cache above, so these are
+      # ~no-ops when warm. (Do NOT add the bpfel-unknown-none target: it has no
+      # prebuilt std; it's built from source.)
+      - name: install rolling nightly (aya-build) + bpf-linker
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          command -v bpf-linker >/dev/null || cargo install bpf-linker
+
+      - name: cache cargo registry
+        uses: https://github.com/actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: cache cargo index
+        uses: https://github.com/actions/cache@v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+
+      - name: cache cargo build
+        uses: https://github.com/actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-target-
+
+      - name: run tests
+        run: cargo test --verbose --locked
+
+      - name: run clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # --all to include the eBPF crate, which is excluded from default-members.
+      - name: check formatting
+        run: cargo fmt --all -- --check
+
+  binary:
+    name: build + publish binary
+    runs-on: docker
+    needs: [rust]
+    # On PRs: build the release binary to validate it compiles + links (nothing
+    # is published). On push to main: also upload it as a CI artifact. On a v*
+    # tag: also attach it (+ sha256) to a Forgejo release. The upload/publish
+    # steps below are individually gated on ref, so PRs run build-only.
+    if: ${{ github.server_url != 'https://github.com' && (github.event_name == 'pull_request' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))) }}
+
+    steps:
+      - name: checkout code
+        uses: https://github.com/actions/checkout@v6
+
+      - name: cache rust toolchain
+        uses: https://github.com/actions/cache@v5
+        with:
+          path: |
+            ~/.rustup
+            ~/.cargo/bin
+          key: ${{ runner.os }}-rust-toolchain-${{ hashFiles('rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-toolchain-
+
+      # rust-toolchain.toml selects nightly-2026-06-22 for the userspace build;
+      # install it (with components) here. This step also bootstraps rustup,
+      # which the next step uses.
+      - name: install rust toolchain (pinned)
+        uses: https://github.com/dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-22
+          components: rust-src, rustfmt, clippy
+
+      # aya-build builds the eBPF crate via `rustup run nightly` (rolling), so we
+      # also need the rolling nightly + rust-src for `-Z build-std`, plus the BPF
+      # linker — exactly `make deps`. Restored from the cache above, so these are
+      # ~no-ops when warm. (Do NOT add the bpfel-unknown-none target: it has no
+      # prebuilt std; it's built from source.)
+      - name: install rolling nightly (aya-build) + bpf-linker
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          command -v bpf-linker >/dev/null || cargo install bpf-linker
+
+      - name: cache cargo registry
+        uses: https://github.com/actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: cache cargo index
+        uses: https://github.com/actions/cache@v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+
+      - name: cache cargo build (release)
+        uses: https://github.com/actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: build release binary
+        run: cargo build --release --locked
+
+      - name: stage release files
+        run: |
+          mkdir -p dist
+          cp target/release/autonice dist/autonice
+          ( cd dist && sha256sum autonice > autonice.sha256 )
+
+      # On push to main, publish the binary as a CI artifact. (v4+ uses the
+      # @actions/artifact v2 API, which Forgejo's runner rejects as GHES; v3 uses
+      # the API the runner supports.)
+      - name: upload autonice artifact (main)
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: https://github.com/actions/upload-artifact@v3
+        with:
+          name: autonice
+          path: |
+            dist/autonice
+            dist/autonice.sha256
+          if-no-files-found: error
+
+      # On a v* tag, create/update the Forgejo release and attach the binary +
+      # sha256. Uses the auto-provided token; if your instance restricts it,
+      # create a RELEASE_TOKEN secret (a PAT with repo write) and use it here.
+      - name: publish forgejo release (tag)
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        uses: https://code.forgejo.org/actions/forgejo-release@v2
+        with:
+          direction: upload
+          url: ${{ github.server_url }}
+          repo: ${{ github.repository }}
+          tag: ${{ github.ref_name }}
+          sha: ${{ github.sha }}
+          release-dir: dist
+          token: ${{ secrets.GITHUB_TOKEN }}
+          override: true
+          verbose: true

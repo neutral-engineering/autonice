@@ -11,7 +11,7 @@ members = [
 default-members = ["autonice", "autonice-common"]
 
 [workspace.package]
-license = "MIT OR Apache-2.0"
+license = "GPL-2.0-only"
 edition = "2024"
 
 [workspace.dependencies]

@@ -1,7 +1,8 @@
 # autonice rules: <match-key> = <nice value>  (-20 highest prio .. 19 lowest)
 #
-# A key matches if it equals the exec'd binary's basename, or is a substring of
-# its full path. First match wins (basename equality preferred).
+# A key matches the exec'd binary's basename. To also match any substring of the
+# full path, opt in with the table form: <key> = { nice = <n>, substring = true }
+# (basename matching is the default, so e.g. `dd` won't catch `ssh-add`).
 #
 # Positive nice (deprioritize) needs no privilege; negative nice (prioritize) or
 # reniceing processes you don't own requires CAP_SYS_NICE (run as root).
@@ -12,12 +13,17 @@
 [cargo]
 nice = 19
 
-[rules]
+[make]
+nice = 19
+
 # Deprioritize heavy background work (single binaries).
-ffmpeg = 15
+[rules]
 dd = 19
-make = 10
-"c++" = 10
+ffmpeg = 15
+gcc = 19
+"g++" = 19
+"c++" = 13
+cmake = 11
 
 # Prioritize latency-sensitive things (needs CAP_SYS_NICE).
 # pipewire = -10

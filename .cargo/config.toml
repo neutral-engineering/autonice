@@ -1,0 +1,4 @@
+# `cargo run` needs privileges to load BPF + renice. This runs the built binary
+# under sudo (preserving env, e.g. RUST_LOG). The build itself runs unprivileged.
+[target."cfg(all())"]
+runner = "sudo -E"

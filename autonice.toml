@@ -1,0 +1,23 @@
+# autonice rules: <match-key> = <nice value>  (-20 highest prio .. 19 lowest)
+#
+# A key matches if it equals the exec'd binary's basename, or is a substring of
+# its full path. First match wins (basename equality preferred).
+#
+# Positive nice (deprioritize) needs no privilege; negative nice (prioritize) or
+# reniceing processes you don't own requires CAP_SYS_NICE (run as root).
+
+# Renice `cargo` and its ENTIRE process subtree (rustc, build scripts, cc, ld)
+# to this nice value. Tracked by parent pid, so it only catches compiles started
+# by cargo — not standalone rustc/cc. Remove this table to disable.
+[cargo]
+nice = 19
+
+[rules]
+# Deprioritize heavy background work (single binaries).
+ffmpeg = 15
+dd = 19
+make = 10
+"c++" = 10
+
+# Prioritize latency-sensitive things (needs CAP_SYS_NICE).
+# pipewire = -10

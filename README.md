@@ -137,7 +137,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now autonice
 
 ## License
 
-MIT or Apache-2.0, at your option.
+GPL2.0
 
 [Aya]: https://aya-rs.dev
 [`bpf-linker`]: https://github.com/aya-rs/bpf-linker

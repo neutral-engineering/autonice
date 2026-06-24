@@ -1,13 +1,25 @@
-# Local test harness — run the daemon against the *host's* execs in a container.
+# Local test harness — run the daemon against the *host's* execs, one container
+# per distro, to prove the SAME binary works on each.
 #
-# This does NOT build autonice. Building needs the nightly + rust-src +
-# bpf-linker toolchain, so build natively first (`make build`); the image is
-# just a thin Arch userland that runs the host-built binary. autonice already
-# embeds its eBPF object, so the binary is all the container needs. Arch base
-# matches the host glibc the binary was linked against — a binary built on Arch
-# won't run on debian-slim.
+# This does NOT build autonice. Build the static binary first with
+# `make build-static` (the host needs the nightly + rust-src + bpf-linker eBPF
+# toolchain); the containers just run it. autonice embeds its eBPF object, so the
+# single binary is all a container needs.
 #
-# Why the privileged settings:
+# Why two services? The release/distribution binary is a *static musl* build
+# (`make release` / `make build-static`) with no glibc dependency, so one binary
+# runs on any distro. The `arch` and `debian` services run that exact same binary
+# on two different userlands to demonstrate it — pick one:
+#
+#   make docker-arch     # archlinux:base
+#   make docker-debian   # debian:trixie-slim   (alias: make docker)
+#
+# They're behind compose profiles, so a bare `docker compose up` starts neither;
+# use the make targets (which build the static binary first) or
+# `docker compose --profile {arch,debian} up`.
+#
+# Why the privileged settings (identical for both — runtime concerns, unchanged
+# by static linking):
 #   * pid: host  — THE important one. autonice's eBPF reports init-namespace
 #     (global) pids; the daemon then reads /proc/<pid>/stat and calls
 #     setpriority(pid) with them. setpriority interprets the pid in the CALLER's
@@ -18,27 +30,37 @@
 #     is the reliable default for tracefs access in dev.
 # The tracepoint is global regardless, so you'll see every exec on the machine.
 #
-#   make build && docker compose up
-#
-# Edit code -> `make build` -> `docker compose restart`. Ctrl-C (or `docker
-# compose down`) to stop. This is barely isolated from the host (privileged +
-# pid:host) — it's a convenience harness, not a sandbox.
+# Edit code -> `make build-static` -> `docker compose --profile <os> restart`.
+# Ctrl-C (or `docker compose down`) to stop. Barely isolated from the host
+# (privileged + pid:host) — a convenience harness, not a sandbox.
+
+# Shared config — the two services differ only in their base image.
+x-autonice: &autonice
+  privileged: true
+  pid: host
+  ulimits:
+    memlock: -1
+  volumes:
+    # Host-built STATIC binary (debug). For the release build, swap in
+    # target/x86_64-unknown-linux-musl/release.
+    - ./target/x86_64-unknown-linux-musl/debug/autonice:/usr/local/bin/autonice:ro
+    # Rules. The daemon checks ./autonice.toml then /etc/autonice.toml; cwd is
+    # / in the container, so mount the config at its system path.
+    - ./autonice.toml:/etc/autonice.toml:ro
+    # tracefs — read to resolve + attach the sched_process_exec tracepoint.
+    # (BTF at /sys/kernel/btf is already visible via the container's sysfs.)
+    - /sys/kernel/tracing:/sys/kernel/tracing:ro
+  environment:
+    RUST_LOG: info
+  command: ["autonice"]
+
 services:
-  autonice:
+  # Same static binary, two userlands — proof it's distro-agnostic.
+  arch:
+    <<: *autonice
     image: archlinux:base
-    privileged: true
-    pid: host
-    ulimits:
-      memlock: -1
-    volumes:
-      # Host-built binary (debug). For a release build, swap in target/release.
-      - ./target/debug/autonice:/usr/local/bin/autonice:ro
-      # Rules. The daemon checks ./autonice.toml then /etc/autonice.toml; cwd is
-      # / in the container, so mount the config at its system path.
-      - ./autonice.toml:/etc/autonice.toml:ro
-      # tracefs — read to resolve + attach the sched_process_exec tracepoint.
-      # (BTF at /sys/kernel/btf is already visible via the container's sysfs.)
-      - /sys/kernel/tracing:/sys/kernel/tracing:ro
-    environment:
-      RUST_LOG: info
-    command: ["autonice"]
+    profiles: ["arch"]
+  debian:
+    <<: *autonice
+    image: debian:trixie-slim
+    profiles: ["debian"]

@@ -60,11 +60,16 @@ jobs:
 
       # rust-toolchain.toml selects nightly-2026-06-22 for the userspace build +
       # fmt/clippy; install it (with components) here. Bump both together. This
-      # step also bootstraps rustup, which the next step uses.
+      # step also bootstraps rustup, which the next step uses. The musl target is
+      # listed here too — this job runs first (the `binary` job `needs` it) and
+      # writes the *shared* toolchain cache, so populating musl now means the
+      # binary job's static build restores it instead of re-downloading musl-std
+      # every run. This job itself builds native; it just primes the cache.
       - name: install rust toolchain (pinned)
         uses: https://github.com/dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-22
+          targets: x86_64-unknown-linux-musl
           components: rust-src, rustfmt, clippy
 
       # aya-build builds the eBPF crate via `rustup run nightly` (rolling), so we
@@ -136,12 +141,15 @@ jobs:
             ${{ runner.os }}-rust-toolchain-
 
       # rust-toolchain.toml selects nightly-2026-06-22 for the userspace build;
-      # install it (with components) here. This step also bootstraps rustup,
-      # which the next step uses.
+      # install it (with components) here, plus the musl target — the published
+      # binary is a fully static musl build with no glibc dependency, so the one
+      # artifact runs on any distro (Arch, Debian, …). This step also bootstraps
+      # rustup, which the next step uses.
       - name: install rust toolchain (pinned)
         uses: https://github.com/dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-06-22
+          targets: x86_64-unknown-linux-musl
           components: rust-src, rustfmt, clippy
 
       # aya-build builds the eBPF crate via `rustup run nightly` (rolling), so we
@@ -178,13 +186,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-release-
 
-      - name: build release binary
-        run: cargo build --release --locked
+      # Static musl build: no glibc dependency, so the published binary runs on
+      # any distro. The eBPF object is still compiled from source by build.rs.
+      - name: build release binary (static musl)
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
 
       - name: stage release files
         run: |
           mkdir -p dist
-          cp target/release/autonice dist/autonice
+          cp target/x86_64-unknown-linux-musl/release/autonice dist/autonice
           ( cd dist && sha256sum autonice > autonice.sha256 )
 
       # On push to main, publish the binary as a CI artifact. (v4+ uses the

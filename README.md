@@ -21,9 +21,10 @@ Two kinds of match:
 
 - **Single binaries** (`[rules]`) — by basename; opt in to path-substring
   matching with the table form `{ nice = N, substring = true }`.
-- **`cargo` subtree** (`[cargo]`) — renice `cargo` *and everything it spawns*
-  (rustc, build scripts, `cc`, `ld`), tracked by parent pid so standalone
-  `rustc`/`cc` outside cargo are left alone.
+- **Subtree roots** (`[subtree]`) — renice each configured root (`cargo`,
+  `make`, …) *and everything it spawns* (rustc, sub-makes, `cc`, `ld`), tracked
+  by parent pid so standalone `rustc`/`cc` outside a root are left alone.
+  Descendants are seeded race-free from a `sched_process_fork` hook.
 
 ## Requirements
 
@@ -95,13 +96,13 @@ Read from `./autonice.toml` then `/etc/autonice.toml`. Nice ranges from `-20`
 (highest priority) to `19` (lowest). If no config exists, uses internal default.
 
 ```toml
-[cargo]
-nice = 19          # cargo + its whole build subtree
+[subtree]
+nice = 19                    # each root + its whole build subtree
+roots = ["cargo", "make"]    # cargo, make, and everything they spawn
 
 [rules]
 dd = 19                                 # <basename> = <nice>; matches basename only
 ffmpeg = { nice = 15, substring = true } # also matches any path substring
-make = 10
 # pipewire = -10                        # negative nice needs CAP_SYS_NICE
 ```
 
@@ -164,11 +165,14 @@ sudo systemctl daemon-reload && sudo systemctl enable --now autonice
 
 ## Caveats
 
-- Parent pid for subtree tracking comes from `/proc/<pid>/stat`, which has a tiny
-  race: a sub-millisecond child can exit before it's read. Hooking
-  `sched_process_fork` would make ancestry race-free.
-- Tracepoint field offsets (`filename` @ 8, `pid` @ 12) are hardcoded; verify on
-  your kernel with `make tracepoint-format`.
+- Subtree descendants are seeded race-free from a `sched_process_fork` hook (the
+  child is recorded the instant it's forked, before it execs). A `/proc/<pid>/stat`
+  parent lookup at exec time remains as a fallback — for fork events not yet
+  drained, and for forks from a non-leader thread (whose tracepoint `parent_pid`
+  is a TID, but whose `/proc` ppid is the tracked process).
+- Tracepoint field offsets are hardcoded (exec: `filename` @ 8, `pid` @ 12;
+  fork: `parent_pid` @ 24, `child_pid` @ 44); verify on your kernel with
+  `make tracepoint-format`.
 
 ## License
 

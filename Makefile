@@ -50,8 +50,9 @@ ebpf-dump: build ## Inspect the generated eBPF ELF (sections + program disasm)
 	llvm-readelf -S "$(OBJ)"
 	llvm-objdump -d "$(OBJ)"
 
-tracepoint-format: ## Show the sched_process_exec field layout (verifies hardcoded offsets)
+tracepoint-format: ## Show the sched_process_{exec,fork} field layouts (verifies hardcoded offsets)
 	sudo cat /sys/kernel/tracing/events/sched/sched_process_exec/format
+	sudo cat /sys/kernel/tracing/events/sched/sched_process_fork/format
 
 deps: ## Install build prerequisites (bpf-linker + nightly rust-src + musl target)
 	rustup component add rust-src --toolchain nightly

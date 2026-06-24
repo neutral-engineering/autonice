@@ -7,14 +7,14 @@
 # Positive nice (deprioritize) needs no privilege; negative nice (prioritize) or
 # reniceing processes you don't own requires CAP_SYS_NICE (run as root).
 
-# Renice `cargo` and its ENTIRE process subtree (rustc, build scripts, cc, ld)
-# to this nice value. Tracked by parent pid, so it only catches compiles started
-# by cargo — not standalone rustc/cc. Remove this table to disable.
-[cargo]
+# Renice each listed root and its ENTIRE process subtree to `nice`. `cargo`
+# catches rustc / build scripts / cc / ld; `make` catches sub-makes / cmake /
+# compilers. Tracked by parent pid (seeded race-free at fork), so only
+# descendants of a root match — standalone rustc/cc/cmake are left to [rules].
+# Remove this table to disable.
+[subtree]
 nice = 19
-
-[make]
-nice = 19
+roots = ["cargo", "make"]
 
 # Deprioritize heavy background work (single binaries).
 [rules]

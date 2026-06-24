@@ -6,8 +6,9 @@
 //!
 //! Two kinds of matching:
 //!   * single-binary rules ([rules]) — match by basename or path substring;
-//!   * cargo subtree ([cargo]) — renice `cargo` AND everything it spawns
-//!     transitively (rustc, build scripts, cc, ld), tracked by parent pid.
+//!   * subtree roots ([subtree]) — renice each configured root (cargo, make, …)
+//!     AND everything it spawns transitively (rustc, sub-makes, cc, ld),
+//!     tracked by parent pid.
 
 mod install;
 
@@ -15,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::mem;
 
 use anyhow::Context as _;
-use autonice_common::ExecEvent;
+use autonice_common::{ExecEvent, ForkEvent};
 use aya::maps::RingBuf;
 use aya::programs::TracePoint;
 use log::{debug, info, warn};
@@ -33,9 +34,10 @@ struct Config {
     /// `substring = true`.
     #[serde(default)]
     rules: HashMap<String, Rule>,
-    /// If present, renice `cargo` and its entire process subtree to this nice.
+    /// If present, renice each configured subtree root and its entire process
+    /// subtree to this nice.
     #[serde(default)]
-    cargo: Option<CargoConfig>,
+    subtree: Option<SubtreeConfig>,
 }
 
 /// A `[rules]` value, in either shorthand or table form:
@@ -74,9 +76,14 @@ impl Rule {
     }
 }
 
+/// `[subtree]` — renice a set of process-tree roots (`cargo`, `make`, …) and
+/// everything they spawn transitively to a single nice value.
 #[derive(Debug, Deserialize)]
-struct CargoConfig {
+struct SubtreeConfig {
     nice: i32,
+    /// Basenames treated as subtree roots. Each root, and every descendant it
+    /// spawns, is reniced to `nice`.
+    roots: Vec<String>,
 }
 
 impl Config {
@@ -111,8 +118,8 @@ fn load_config() -> Config {
                     info!(
                         "loaded {} rule(s){} from {path}",
                         cfg.rules.len(),
-                        if cfg.cargo.is_some() {
-                            " + cargo-subtree tracking"
+                        if cfg.subtree.is_some() {
+                            " + subtree tracking"
                         } else {
                             ""
                         },
@@ -152,8 +159,8 @@ fn renice(pid: u32, nice: i32) -> std::io::Result<()> {
 /// Runtime state carried across events.
 struct Daemon {
     config: Config,
-    /// pids known to be `cargo` or a descendant of one.
-    cargo_subtree: HashSet<u32>,
+    /// pids known to be a subtree root or a descendant of one.
+    subtree_pids: HashSet<u32>,
     events_since_prune: u32,
 }
 
@@ -161,7 +168,7 @@ impl Daemon {
     fn new(config: Config) -> Self {
         Self {
             config,
-            cargo_subtree: HashSet::new(),
+            subtree_pids: HashSet::new(),
             events_since_prune: 0,
         }
     }
@@ -186,13 +193,21 @@ impl Daemon {
         let path = path.trim_end_matches('\0');
         let pid = event.pid;
 
-        // --- cargo subtree: cargo itself, or any child of a tracked pid ---
-        if let Some(cargo) = &self.config.cargo {
-            let in_subtree = basename(path) == "cargo"
-                || parent_pid(pid).is_some_and(|ppid| self.cargo_subtree.contains(&ppid));
+        // --- subtree: a configured root, or any child of a tracked pid ---
+        if let Some(subtree) = &self.config.subtree {
+            let base = basename(path);
+            // `subtree_pids.contains(&pid)` is the fork-hook fast path: the child
+            // was already recorded at `sched_process_fork`, so we needn't touch
+            // /proc. The /proc lookup remains as a fallback for forks whose event
+            // hasn't been drained yet, and for forks from a non-leader thread
+            // (whose tracepoint `parent_pid` is a TID we don't track, but whose
+            // /proc ppid is the tracked process).
+            let in_subtree = subtree.roots.iter().any(|r| r == base)
+                || self.subtree_pids.contains(&pid)
+                || parent_pid(pid).is_some_and(|ppid| self.subtree_pids.contains(&ppid));
             if in_subtree {
-                self.cargo_subtree.insert(pid);
-                self.apply(pid, cargo.nice, path, "cargo");
+                self.subtree_pids.insert(pid);
+                self.apply(pid, subtree.nice, path, "subtree");
                 self.prune_tick();
                 return;
             }
@@ -207,6 +222,31 @@ impl Daemon {
         }
     }
 
+    /// A `sched_process_fork`: if the parent is tracked, record the child the
+    /// instant it's created — before it execs — so it's caught even if the
+    /// parent exits in the window the /proc-at-exec lookup would miss. The
+    /// child's own exec is reniced later by `handle`; this just seeds the set.
+    fn handle_fork(&mut self, bytes: &[u8]) {
+        // Forks only matter while subtree tracking is on.
+        if self.config.subtree.is_none() {
+            return;
+        }
+        if bytes.len() < mem::size_of::<ForkEvent>() {
+            return;
+        }
+        // SAFETY: ForkEvent is `#[repr(C)]` Pod; length checked. Unaligned read
+        // since the ring buffer slice has no alignment guarantee.
+        let event: ForkEvent = unsafe { (bytes.as_ptr() as *const ForkEvent).read_unaligned() };
+        if self.subtree_pids.contains(&event.parent_pid) {
+            self.subtree_pids.insert(event.child_pid);
+            debug!(
+                "fork parent={} -> child={} (tracked)",
+                event.parent_pid, event.child_pid
+            );
+        }
+        self.prune_tick();
+    }
+
     /// Periodically drop pids whose process has exited, so the set stays bounded
     /// across many builds.
     fn prune_tick(&mut self) {
@@ -215,14 +255,27 @@ impl Daemon {
             return;
         }
         self.events_since_prune = 0;
-        let before = self.cargo_subtree.len();
-        self.cargo_subtree
+        let before = self.subtree_pids.len();
+        self.subtree_pids
             .retain(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
-        debug!(
-            "pruned cargo subtree: {} -> {}",
-            before,
-            self.cargo_subtree.len()
-        );
+        debug!("pruned subtree: {} -> {}", before, self.subtree_pids.len());
+    }
+}
+
+/// The ring buffer type as produced by `RingBuf::try_from(map)` — `RingBuf` is
+/// generic over its backing map, so name the concrete instantiation once.
+type EventRing = RingBuf<aya::maps::MapData>;
+
+/// Await readability of an optional ring-buffer fd. When there is no fd (subtree
+/// tracking is off, so the fork tracepoint was never attached), this future
+/// never resolves — which leaves the owning `select!` arm permanently inert
+/// instead of busy-looping on a `None`.
+async fn readable_opt(
+    fd: &mut Option<AsyncFd<EventRing>>,
+) -> std::io::Result<tokio::io::unix::AsyncFdReadyMutGuard<'_, EventRing>> {
+    match fd {
+        Some(fd) => fd.readable_mut().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -291,7 +344,23 @@ async fn main() -> anyhow::Result<()> {
     info!("attached to sched:sched_process_exec; watching execs…");
 
     let ring = RingBuf::try_from(ebpf.take_map("EVENTS").context("EVENTS map not found")?)?;
-    let mut async_fd = AsyncFd::new(ring)?;
+    let mut exec_fd = AsyncFd::new(ring)?;
+
+    // Fork tracking only earns its keep when [subtree] is configured, so skip the
+    // system-wide fork tracepoint (and its ring buffer) entirely otherwise.
+    let mut fork_fd = if daemon.config.subtree.is_some() {
+        let fork_program: &mut TracePoint = ebpf
+            .program_mut("autonice_fork")
+            .context("program `autonice_fork` not found")?
+            .try_into()?;
+        fork_program.load()?;
+        fork_program.attach("sched", "sched_process_fork")?;
+        info!("attached to sched:sched_process_fork; watching forks…");
+        let forks = RingBuf::try_from(ebpf.take_map("FORKS").context("FORKS map not found")?)?;
+        Some(AsyncFd::new(forks)?)
+    } else {
+        None
+    };
 
     // Shut down on SIGINT (Ctrl-C) or SIGTERM — the latter is what `systemctl
     // stop` and `docker stop`/`compose down` send. The kernel auto-detaches the
@@ -300,7 +369,13 @@ async fn main() -> anyhow::Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
 
     loop {
+        // `biased` so the arms are polled top-to-bottom: signals first (a flood
+        // of events can't delay shutdown), then forks before execs. Since a
+        // child's fork is submitted before its exec, draining the fork ring first
+        // when both are ready seeds the child into the subtree set before its
+        // exec is acted on — the /proc lookup in `handle` covers the rest.
         tokio::select! {
+            biased;
             _ = sigint.recv() => {
                 info!("received SIGINT, shutting down");
                 return Ok(());
@@ -309,7 +384,16 @@ async fn main() -> anyhow::Result<()> {
                 info!("received SIGTERM, shutting down");
                 return Ok(());
             }
-            guard = async_fd.readable_mut() => {
+            // Disabled (pends forever) when subtree tracking is off.
+            guard = readable_opt(&mut fork_fd) => {
+                let mut guard = guard?;
+                let ring = guard.get_inner_mut();
+                while let Some(item) = ring.next() {
+                    daemon.handle_fork(item.as_ref());
+                }
+                guard.clear_ready();
+            }
+            guard = exec_fd.readable_mut() => {
                 let mut guard = guard?;
                 let ring = guard.get_inner_mut();
                 while let Some(item) = ring.next() {
@@ -330,8 +414,17 @@ mod tests {
     #[test]
     fn embedded_default_config_parses() {
         let cfg: Config = toml::from_str(DEFAULT_CONFIG).expect("default config parses");
-        assert!(cfg.cargo.is_some(), "default ships cargo-subtree tracking");
+        assert!(cfg.subtree.is_some(), "default ships subtree tracking");
         assert!(!cfg.rules.is_empty(), "default ships some rules");
+    }
+
+    #[test]
+    fn subtree_config_parses_roots() {
+        let cfg: Config =
+            toml::from_str("[subtree]\nnice = 19\nroots = [\"cargo\", \"make\"]\n").unwrap();
+        let subtree = cfg.subtree.expect("subtree present");
+        assert_eq!(subtree.nice, 19);
+        assert_eq!(subtree.roots, ["cargo", "make"]);
     }
 
     #[test]

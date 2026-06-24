@@ -9,12 +9,17 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 
-use autonice_common::ExecEvent;
+use autonice_common::{ExecEvent, ForkEvent};
 
 /// Ring buffer that carries exec events to userspace. 256 KiB is plenty for a
 /// bursty-but-low-rate event like process exec.
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Ring buffer that carries fork events to userspace. Forks are higher-rate than
+/// execs but each event is tiny (8 bytes), so the same 256 KiB holds far more.
+#[map]
+static FORKS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 // Field offsets within the `sched/sched_process_exec` tracepoint record. These
 // come from /sys/kernel/tracing/events/sched/sched_process_exec/format and have
@@ -27,6 +32,20 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 //   sudo cat /sys/kernel/tracing/events/sched/sched_process_exec/format
 const FILENAME_DATA_LOC_OFFSET: usize = 8;
 const PID_OFFSET: usize = 12;
+
+// Field offsets within the `sched/sched_process_fork` tracepoint record. From
+// /sys/kernel/tracing/events/sched/sched_process_fork/format; stable for many
+// kernel releases (the layout is fixed by the kernel's TRACE_EVENT macro):
+//
+//   field:char  parent_comm[16];  offset:8;   size:16;
+//   field:pid_t parent_pid;       offset:24;  size:4;
+//   field:char  child_comm[16];   offset:28;  size:16;
+//   field:pid_t child_pid;        offset:44;  size:4;
+//
+// Verify on a given kernel with:
+//   sudo cat /sys/kernel/tracing/events/sched/sched_process_fork/format
+const PARENT_PID_OFFSET: usize = 24;
+const CHILD_PID_OFFSET: usize = 44;
 
 #[tracepoint]
 pub fn autonice(ctx: TracePointContext) -> u32 {
@@ -60,6 +79,35 @@ fn try_autonice(ctx: TracePointContext) -> Result<u32, i64> {
         if let Ok(read) = bpf_probe_read_kernel_str_bytes(src, &mut (*event).filename) {
             (*event).filename_len = read.len() as u32;
         }
+    }
+    entry.submit(0);
+
+    Ok(0)
+}
+
+#[tracepoint]
+pub fn autonice_fork(ctx: TracePointContext) -> u32 {
+    match try_fork(ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_fork(ctx: TracePointContext) -> Result<u32, i64> {
+    // Two fixed u32 reads — no `__data_loc` string to unpack, so simpler than the
+    // exec path.
+    let parent_pid: u32 = unsafe { ctx.read_at(PARENT_PID_OFFSET)? };
+    let child_pid: u32 = unsafe { ctx.read_at(CHILD_PID_OFFSET)? };
+
+    let Some(mut entry) = FORKS.reserve::<ForkEvent>(0) else {
+        // Ring buffer full: drop this event rather than block the fork path.
+        return Ok(0);
+    };
+
+    let event = entry.as_mut_ptr();
+    unsafe {
+        (*event).parent_pid = parent_pid;
+        (*event).child_pid = child_pid;
     }
     entry.submit(0);
 
